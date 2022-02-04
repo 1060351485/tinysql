@@ -356,7 +356,16 @@ func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expressi
 	// TODO: Here you need to push the predicates across the aggregation.
 	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+	var condsToPush, rest []expression.Expression
+	for _, cond := range predicates {
+		if _, ok := cond.(*expression.Constant); ok {
+			condsToPush = append(condsToPush, cond)
+		} else {
+			rest = append(rest, cond)
+		}
+	}
+	la.baseLogicalPlan.PredicatePushDown(condsToPush)
+	return rest, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
