@@ -212,6 +212,16 @@ type candidatePath struct {
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
 func compareCandidates(lhs, rhs *candidatePath) int {
 	// TODO: implement the content according to the header comment.
+	columnCompare := compareInt(lhs.columnSet.Len(), rhs.columnSet.Len())
+	propertyCompare := compareBool(lhs.isMatchProp, rhs.isMatchProp)
+	scanCompare := compareBool(lhs.isSingleScan, rhs.isSingleScan)
+	sum := columnCompare + propertyCompare + scanCompare
+	if columnCompare <= 0 && propertyCompare <= 0 && scanCompare <= 0 && sum < 0 {
+		return -1
+	}
+	if columnCompare >= 0 && propertyCompare >= 0 && scanCompare >= 0 && sum > 0 {
+		return 1
+	}
 	return 0
 }
 
@@ -274,7 +284,19 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
 		//       You'll need to implement the content in function `compareCandidates`.
 		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+		toPrune := false
+		for i := len(candidates) - 1; i >= 0; i-- {
+			result := compareCandidates(currentCandidate, candidates[i])
+			if result == 1 {
+				toPrune = true
+				break
+			} else if result == -1 {
+				candidates = append(candidates[:i], candidates[i+1:]...)
+			}
+		}
+		if !toPrune {
+			candidates = append(candidates, currentCandidate)
+		}
 	}
 	return candidates
 }
@@ -702,4 +724,24 @@ func (ds *DataSource) getOriginalPhysicalIndexScan(prop *property.PhysicalProper
 	}
 	cost += float64(len(is.Ranges)) * sessVars.SeekFactor
 	return is, cost, rowCount
+}
+
+func compareInt(l, r int) int {
+	if l == r {
+		return 0
+	}
+	if l < r {
+		return 1
+	}
+	return -1
+}
+
+func compareBool(l, r bool) int {
+	if l == r {
+		return 0
+	}
+	if !l {
+		return 1
+	}
+	return -1
 }
