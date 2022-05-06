@@ -16,13 +16,14 @@ package tikv
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/pingcap/failpoint"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
@@ -346,10 +347,26 @@ func (c *twoPhaseCommitter) keySize(key []byte) int {
 }
 
 func (c *twoPhaseCommitter) buildPrewriteRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.PrewriteRequest
 	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
-	return tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req, pb.Context{})
+	m := batch.keys
+	mutations := make([]*pb.Mutation, len(m))
+	for i := 0; i < len(m); i++ {
+		mutations[i] = &pb.Mutation{
+			Op:    pb.Op_Put,
+			Key:   m[i],
+			Value: c.mutations[string(m[i])].Value,
+		}
+	}
+
+	req := &pb.PrewriteRequest{
+		Mutations:    mutations,
+		PrimaryLock:  c.primary(),
+		StartVersion: c.startTS,
+		LockTtl:      c.lockTTL,
+	}
+	return tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req, pb.Context{
+		RegionId: batch.region.id,
+	})
 }
 
 func (actionPrewrite) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
@@ -419,35 +436,91 @@ func (c *twoPhaseCommitter) getUndeterminedErr() error {
 
 func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
 	// follow actionPrewrite.handleSingleBatch, build the commit request
-	var sender *RegionRequestSender
-	var err error
+	//var sender *RegionRequestSender
+	//var err error
 	// build and send the commit request
 	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
-
-	// If we fail to receive response for the request that commits primary key, it will be undetermined whether this
-	// transaction has been successfully committed.
-	// Under this circumstance,  we can not declare the commit is complete (may lead to data lost), nor can we throw
-	// an error (may lead to the duplicated key error when upper level restarts the transaction). Currently the best
-	// solution is to populate this error and let upper layer drop the connection to the corresponding mysql client.
-	isPrimary := bytes.Equal(batch.keys[0], c.primary())
-	if isPrimary && sender.rpcError != nil {
-		c.setUndeterminedErr(errors.Trace(sender.rpcError))
-	}
-
-	failpoint.Inject("mockFailAfterPK", func() {
-		if !isPrimary {
-			err = errors.New("commit secondary keys error")
-		}
+	req := tikvrpc.NewRequest(tikvrpc.CmdCommit, &pb.CommitRequest{
+		StartVersion:  c.startTS,
+		Keys:          batch.keys,
+		CommitVersion: c.commitTS,
 	})
-	if err != nil {
-		return errors.Trace(err)
+	sender := NewRegionRequestSender(c.store.GetRegionCache(), c.store.GetTiKVClient())
+	for {
+		resp, err := sender.SendReq(bo, req, batch.region, readTimeoutShort)
+		// If we fail to receive response for the request that commits primary key, it will be undetermined whether this
+		// transaction has been successfully committed.
+		// Under this circumstance,  we can not declare the commit is complete (may lead to data lost), nor can we throw
+		// an error (may lead to the duplicated key error when upper level restarts the transaction). Currently the best
+		// solution is to populate this error and let upper layer drop the connection to the corresponding mysql client.
+		isPrimary := bytes.Equal(batch.keys[0], c.primary())
+		if isPrimary && sender.rpcError != nil {
+			c.setUndeterminedErr(errors.Trace(sender.rpcError))
+		}
+
+		failpoint.Inject("mockFailAfterPK", func() {
+			if !isPrimary {
+				err = errors.New("commit secondary keys error")
+			}
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		// handle the response and error refer to actionPrewrite.handleSingleBatch
+		// YOUR CODE HERE (proj6).
+		regionErr, err := resp.GetRegionError()
+		if err != nil {
+			return err
+		}
+		if regionErr != nil {
+			// For other region error and the fake region error, backoff because
+			// there's something wrong.
+			// For the real EpochNotMatch error, don't backoff.
+			if regionErr.GetEpochNotMatch() == nil {
+				err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+				if err != nil {
+					return errors.Trace(err)
+				}
+			}
+			err = c.commitKeys(bo, batch.keys)
+			return errors.Trace(err)
+		}
+		if resp.Resp == nil {
+			return errors.Trace(ErrBodyMissing)
+		}
+		commitResp := resp.Resp.(*pb.CommitResponse)
+		if isPrimary {
+			c.setUndeterminedErr(nil)
+		}
+		if keyErr := commitResp.GetError(); keyErr != nil {
+			c.mu.RLock()
+			defer c.mu.RUnlock()
+			err = extractKeyErr(keyErr)
+			if c.mu.committed {
+				// No secondary key could be rolled back after it's primary key is committed.
+				// There must be a serious bug somewhere.
+				hexBatchKeys := func(keys [][]byte) []string {
+					var res []string
+					for _, k := range keys {
+						res = append(res, hex.EncodeToString(k))
+					}
+					return res
+				}
+				logutil.BgLogger().Error("2PC failed commit key after primary key committed",
+					zap.Error(err),
+					zap.Uint64("txnStartTS", c.startTS),
+					zap.Uint64("commitTS", c.commitTS),
+					zap.Strings("keys", hexBatchKeys(batch.keys)))
+				return err
+			}
+			logutil.BgLogger().Debug("2PC failed commit primary key",
+				zap.Error(err),
+				zap.Uint64("txnStartTS", c.startTS))
+			return err
+		}
+		break
 	}
-
-	// handle the response and error refer to actionPrewrite.handleSingleBatch
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Group that contains primary key is always the first.
@@ -458,16 +531,36 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 
 func (actionCleanup) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
 	// follow actionPrewrite.handleSingleBatch, build the rollback request
-
 	// build and send the rollback request
 	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	req := tikvrpc.NewRequest(tikvrpc.CmdBatchRollback, &pb.BatchRollbackRequest{
+		Keys:         batch.keys,
+		StartVersion: c.startTS,
+	})
 	// handle the response and error refer to actionPrewrite.handleSingleBatch
-
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	resp, err := c.store.SendReq(bo, req, batch.region, readTimeoutShort)
+	if err != nil {
+		return err
+	}
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return err
+	}
+	if regionErr != nil {
+		err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+		if err != nil {
+			return err
+		}
+		return c.cleanupKeys(bo, batch.keys)
+	}
+	if keyErr := resp.Resp.(*pb.BatchRollbackResponse).GetError(); keyErr != nil {
+		err = errors.Errorf("connID %d 2PC cleanup failed: %s", c.connID, keyErr)
+		logutil.BgLogger().Debug("2PC failed cleanup key",
+			zap.Error(err),
+			zap.Uint64("txnStartTS", c.startTS))
+		return err
+	}
 	return nil
-
 }
 
 func (c *twoPhaseCommitter) prewriteKeys(bo *Backoffer, keys [][]byte) error {

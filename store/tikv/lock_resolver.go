@@ -292,10 +292,13 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 	// 2.3 No lock -- concurrence prewrite.
 
 	var status TxnStatus
-	var req *tikvrpc.Request
+	req := tikvrpc.NewRequest(tikvrpc.CmdCheckTxnStatus, &kvrpcpb.CheckTxnStatusRequest{
+		PrimaryKey: primary,
+		LockTs:     txnID,
+		CurrentTs:  currentTS,
+	})
 	// build the request
 	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
 	for {
 		loc, err := lr.store.GetRegionCache().LocateKey(bo, primary)
 		if err != nil {
@@ -319,11 +322,24 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 		if resp.Resp == nil {
 			return status, errors.Trace(ErrBodyMissing)
 		}
-		_ = resp.Resp.(*kvrpcpb.CheckTxnStatusResponse)
+		cmdResp := resp.Resp.(*kvrpcpb.CheckTxnStatusResponse)
 
 		// Assign status with response
 		// YOUR CODE HERE (proj6).
-		panic("YOUR CODE HERE")
+		status.action = cmdResp.Action
+
+		if cmdResp.LockTtl != 0 {
+			status.ttl = cmdResp.LockTtl
+		} else {
+			status.commitTS = cmdResp.CommitVersion
+			if status.IsCommitted() ||
+				(status.ttl == 0 && (status.action == kvrpcpb.Action_NoAction ||
+					status.action == kvrpcpb.Action_LockNotExistRollback ||
+					status.action == kvrpcpb.Action_TTLExpireRollback)) {
+				lr.saveResolved(txnID, status)
+			}
+		}
+
 		return status, nil
 	}
 
@@ -343,12 +359,17 @@ func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cl
 			return nil
 		}
 
-		var req *tikvrpc.Request
-
 		// build the request
 		// YOUR CODE HERE (proj6).
-		panic("YOUR CODE HERE")
-
+		lreq := &kvrpcpb.ResolveLockRequest{
+			StartVersion: l.TxnID,
+		}
+		if status.IsCommitted() {
+			lreq.CommitVersion = status.CommitTS()
+		} else {
+			logutil.BgLogger().Info("resolveLock rollback", zap.String("lock", l.String()))
+		}
+		req := tikvrpc.NewRequest(tikvrpc.CmdResolveLock, lreq)
 		resp, err := lr.store.SendReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return errors.Trace(err)

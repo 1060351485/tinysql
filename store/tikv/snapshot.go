@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/kv"
+	"math"
 	"strings"
 
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
@@ -36,6 +37,7 @@ var (
 
 const (
 	scanBatchSize = 256
+	maxTimestamp  = math.MaxUint64
 )
 
 // tikvSnapshot implements the kv.Snapshot interface.
@@ -116,6 +118,7 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 			Key:     k,
 			Version: s.version.Ver,
 		}, pb.Context{})
+	var firstLock *Lock
 	for {
 		loc, err := s.store.regionCache.LocateKey(bo, k)
 		if err != nil {
@@ -147,9 +150,33 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 			//   1. The transaction is during commit, wait for a while and retry.
 			//   2. The transaction is dead with some locks left, resolve it.
 			// YOUR CODE HERE (proj6).
-			panic("YOUR CODE HERE")
+			lock, err := extractLockFromKeyErr(keyErr)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			if firstLock == nil {
+				firstLock = lock
+			} else if s.version.Ver == maxTimestamp && firstLock.TxnID != lock.TxnID {
+				// If it is an autocommit point get, it needs to be blocked only
+				// by the first lock it meets. During retries, if the encountered
+				// lock is different from the first one, we can omit it.
+				_, err := cli.ResolveLocks(bo, s.version.Ver, []*Lock{firstLock, lock})
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			msBeforeExpired, err := cli.ResolveLocks(bo, s.version.Ver, []*Lock{firstLock})
+			if err != nil {
+				return nil, err
+			}
+			if msBeforeExpired > 0 {
+				err = bo.BackoffWithMaxSleep(BoTxnLock, int(msBeforeExpired), errors.New(keyErr.String()))
+				if err != nil {
+					return nil, err
+				}
+			}
 			continue
-
 		}
 		return val, nil
 	}
